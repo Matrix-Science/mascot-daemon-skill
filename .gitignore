@@ -1,0 +1,25 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+nul
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Archives / build artefacts
+*.zip
+*.tar.gz
+
+# Credentials — TaskDB and Mascot security logins must never be committed
+.env
+.env.*
+!.env.example
+*.pgpass
+
+# Daemon task database backups / dumps
+*_TaskDB_Export.xml
+*.vdb5
+*.mdb
+*.sql
