@@ -188,6 +188,24 @@ def monitor_task(conn, task_uid, poll_interval=30):
 
 These are the failure modes that actually bite, in rough order of how often they do.
 
+### The Daemon Engine is not running: tasks sit at `new` forever
+
+Tasks are executed by the **Mascot Daemon Engine** (`MascotDaemonEngine.exe`), a separate process
+from the GUI (`MascotDaemon.exe`). If the engine is down, an inserted task stays at
+`task_status='new'` with `action_request='Run'` indefinitely — no error, no event, nothing. Check
+before submitting work:
+
+```
+tasklist | findstr /i MascotDaemonEngine
+```
+
+The engine is typically a console/tray process, not a Windows service — and unrelated
+Daemon-branded services (web UI / API components) can be Running while the engine itself is down,
+so a services check alone proves nothing. Behavioral liveness test: the engine clears
+`action_request` when it picks a task up; if the column still reads `Run` after a minute, the
+engine is not consuming the queue. Start Mascot Daemon (the GUI starts the engine) or run
+`MascotDaemonEngine.exe` directly.
+
 ### A silently completed task means a bad reference
 
 By far the most common failure. The task goes straight from `new` to `completed` in seconds, with no
@@ -258,7 +276,7 @@ fails. Query `mascot_daemon_events` for the task first, then the Mascot Server e
 
 1. Confirm both prerequisites hold — SQL engine, and Mascot security enabled (`references/SETUP.md`).
 2. Use `contaminants` or `cRAP` and one small raw file or a pre-made MGF.
-3. Check the Daemon engine is actually running (system tray, or the Mascot Daemon Windows service).
+3. Check the Daemon Engine process is actually running (`tasklist | findstr /i MascotDaemonEngine`) — see the first gotcha.
 4. After inserting, confirm the task appears in the Daemon GUI — if it does not, the insert is wrong.
 5. Watch `task_status`. Stuck on `new` usually means `action_request` was never set to `Run`.
 6. If it goes to `paused`, read `mascot_daemon_events` before guessing.
