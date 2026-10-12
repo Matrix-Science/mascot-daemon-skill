@@ -85,6 +85,8 @@ set `next_action`, file numbering and ownership columns for you. Points that hav
   fail validation. Clone rather than build from scratch:
   `create_parameter_set(label="new", base_parameter_set="known-good", overrides={"db": "...", "tol": 10})`.
   `None` in `overrides` writes NULL — which is what blank columns need (see the MDS1194 gotcha).
+  The tool's docstring says `report` "0 = AUTO"; `report=0` has triggered MDS1194, so pass `None`
+  (NULL) for AUTO.
 - **`create_task`** inserts with `action_request=''` unless `run_immediately=True`. For DIA raw files
   pass `import_filter="Mascot Distiller (DIA)"` (older builds of the tool always wrote plain
   `Mascot Distiller`; check the stored row).
@@ -254,8 +256,8 @@ Check both before looking anywhere else.
 
 When inserting into `mascot_daemon_files`, set `next_action` to `NOW()` / `datetime.now()`. Daemon
 skips files whose `next_action` still holds the placeholder timestamp `2001-01-01 01:01:01`, and
-marks the task completed without processing anything. The column is `NOT NULL` with no default on
-some installs; a row inserted without it can leave the task sitting at `new` with no error.
+marks the task completed without processing anything. (Unverified: one note says the column is
+`NOT NULL` with no default and that omitting it leaves the task at `new` — always set it.)
 
 ### Task control: `task_status` vs `action_request`
 
@@ -265,13 +267,15 @@ clears the field once it has acted, and may write a reason to `action_response`.
 | From status | `Run` | `Pause` | `Cancel` |
 |---|---|---|---|
 | `new` | starts the task | holds it (now `paused`, so see below) | — |
-| `running` | — | pauses after the current step | **refused** — Pause first |
-| `paused` | **refused**: `action_response` = "Error 9000: Cannot run a task unless status is new" (or nothing happens) | — | cancels |
+| `running` | — | pauses after the current step | **silently ignored** — the task keeps running; Pause first |
+| `paused` | **refused**: the engine either writes "Error 9000: Cannot run a task unless status is new" to `action_response` or flips the task to `cancelled` | — | cancels |
 
-- **A paused task cannot be resumed** through TaskDB (verified for error-paused tasks on several
-  hosts; don't plan on resuming one you paused yourself either). Fix the cause, `Cancel` it, and submit a new task with the same files and
+- **A paused task cannot be resumed** through TaskDB (verified on one site, for error-paused tasks;
+  untested for tasks you paused yourself — assume the same). Fix the cause, `Cancel` it, and submit a new task with the same files and
   parameter set. Pausing a task whose search is already on the server throws that search's work away.
-- **To stop a running search:** set `Pause`, wait for `task_status='paused'`, then `Cancel`. That
+- **To stop a running search:** from `running`, Cancel is silently ignored — Pause first (Daemon help:
+  pause the task, then cancel and delete it). Set `Pause`, wait for `task_status='paused'`, then
+  `Cancel`. That
   stops Daemon only — the search keeps running on Mascot Server. Cancel it there too (database status
   page, or the Mascot Server MCP `cancel_search` with the F-number). The Daemon `mascot_task_id` is
   not an F-number; the newest `F*.msr` in `<MASCOT_HOME>/data/<YYYYMMDD>/` is. Confirm the search
@@ -282,10 +286,14 @@ clears the field once it has acted, and may write a reason to `action_response`.
 The engine reads many parameter-set columns as .NET Booleans. An empty string (or a single space)
 throws `(MDS1194) Conversion from string "" to type 'Boolean' is not valid` and pauses the task a few
 seconds after "Connected to Mascot server", before any search is submitted. NULL takes a different
-code path and works. Columns seen to trigger it: `errortolerant`, `percolate`, `ml_adapter_param`,
-`quantitation`, `decoy`, `icat`, `crosslinking`, `overview`, `reptype`, `msm_user_name`,
-`msm_group_name`, `mascot_server`, `et_classifications`. Booleans take `'0'`, `'1'` or NULL. Also
-reported: `report=0` (use NULL for AUTO) and `decoy='0'` combined with `target_fdr_percent='1'`.
+code path and works. Booleans take `'0'`, `'1'` or NULL.
+
+- **Observed to trigger it:** `decoy=' '` (a space); `report=0` (use NULL for AUTO);
+  `pep_isotope_error=0` (use NULL — though one working set had 0); `decoy='0'` with
+  `target_fdr_percent` set (clear the FDR when decoy is off).
+- **Suspected** (set to NULL together with others in a fix, never isolated): `errortolerant`,
+  `percolate`, `icat`. A working template ran with `errortolerant=''`, so `''` is not fatal in every
+  column — but every known-good set uses NULL for unused columns, so do the same.
 Safest: clone a parameter set that is known to run (`INSERT ... SELECT` or the MCP
 `base_parameter_set`) and override only what differs; compare column by column against a working
 set if a task pauses.

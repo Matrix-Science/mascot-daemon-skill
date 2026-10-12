@@ -173,7 +173,8 @@ heavy searches at once.**
 - **Chain tasks** with `schedule_type='after'` and `start_after='<uid> <label>'` of the previous
   task, when you want one task (and one clean run time) per file.
 
-Do **not** pause tasks and release them later with `Run` — a paused task cannot be re-run.
+Do **not** pause tasks and release them later with `Run` — error-paused tasks cannot be re-run
+(untested for tasks you paused yourself; assume the same).
 
 ## Distiller passes run in parallel across tasks
 

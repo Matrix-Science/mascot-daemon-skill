@@ -43,7 +43,7 @@ One row per task. This is the row you insert to create work.
 | `merge_data_files` | smallint | Boolean: merge all files into a single search |
 | `search_priority` | smallint | −20 to 0 (nice value) |
 | `mascot_user_id` | integer | Mascot security user ID — only meaningful with server security enabled |
-| `action_request` | varchar(255) | **Your control channel.** `"Run"` (only from `new`), `"Pause"`, `"Cancel"` (only from `paused`) |
+| `action_request` | varchar(255) | **Your control channel.** `"Run"` (only from `new`), `"Pause"`, `"Cancel"` (from `paused`; ignored while running) |
 | `action_response` | varchar(255) | Response from the engine, e.g. `Error 9000: Cannot run a task unless status is new` |
 | `pre_task_command` | text | Shell command run before the task |
 | `pre_task_wait` | smallint | Boolean: wait for the command to finish |
@@ -66,7 +66,7 @@ One row per data file in a task.
 | `file_number` | integer PK | `SELECT COALESCE(MAX(file_number),0)+1 FROM mascot_daemon_files` |
 | `task_UID` | integer FK | Parent task |
 | `file_name` | varchar(255) | Full local or UNC path to the data file. Network files **must** be UNC, not a mapped drive letter |
-| `next_action` | timestamp | **Set to `NOW()` when inserting.** Files still holding the placeholder `2001-01-01 01:01:01` are skipped, and the task completes without processing anything. `NOT NULL` with no default on some installs |
+| `next_action` | timestamp | **Set to `NOW()` when inserting.** Files still holding the placeholder `2001-01-01 01:01:01` are skipped, and the task completes without processing anything. Possibly `NOT NULL` with no default (unverified) — always set it |
 | `file_comment` | varchar(255) | Search title with tags substituted |
 | `file_size` | integer | File size when last checked |
 | `size_checked` | timestamp | When the size was last checked |
@@ -155,8 +155,8 @@ One row per reusable parameter set. **This is the preferred way to store search 
 **`seg` and `precursor` are `real`.** Passing an empty string instead of `NULL` is a type error on
 most engines.
 
-**Leave unused columns `NULL`, never `''`.** Many text columns are read by the engine as Booleans;
-`''` pauses the task with MDS1194 (see SKILL.md). Booleans take `'0'`, `'1'` or `NULL`.
+**Leave unused columns `NULL`, never `''`.** Some text columns are read by the engine as Booleans;
+`''` or `' '` can pause the task with MDS1194 (see SKILL.md for which are confirmed). Booleans take `'0'`, `'1'` or `NULL`.
 
 **ML rescoring needs the decoy search.** Keep `decoy='1'` with `percolate='1'`; for TMT data the
 MS2PIP model is `TMT`, not `HCD2019`.
