@@ -1,6 +1,6 @@
 # Mascot Daemon Skill
 
-**Version:** 1.1.0 &nbsp;|&nbsp; **License:** Apache-2.0
+**Version:** 1.1.1 &nbsp;|&nbsp; **License:** Apache-2.0
 
 An Agent Skill that teaches AI coding assistants how to drive **Mascot Daemon** programmatically
 through its task database (TaskDB) — creating, submitting, and monitoring proteomics search tasks
