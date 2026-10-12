@@ -84,16 +84,19 @@ set `next_action`, file numbering and ownership columns for you. Points that hav
 - **`create_parameter_set` / `update_parameter_set` need `label`** on every call; calls without it
   fail validation. Clone rather than build from scratch:
   `create_parameter_set(label="new", base_parameter_set="known-good", overrides={"db": "...", "tol": 10})`.
-  `None` in `overrides` writes NULL — which is what blank columns need (see the MDS1194 gotcha).
-  The tool's docstring says `report` "0 = AUTO"; `report=0` has triggered MDS1194, so pass `None`
-  (NULL) for AUTO.
+  `None` in `overrides` writes NULL — which is what blank columns need (see the MDS1194 gotcha),
+  including `report=None` for AUTO.
 - **`create_task`** inserts with `action_request=''` unless `run_immediately=True`. For DIA raw files
   pass `import_filter="Mascot Distiller (DIA)"` (older builds of the tool always wrote plain
   `Mascot Distiller`; check the stored row).
-- **`set_task_action`'s docstring says `Run` resumes a paused task. It does not** — see
-  "Task control" below.
-- After an MCP `delete_task`, one build left an `idle in transaction` session holding row locks, so
-  the engine reported "failed to update Mascot Daemon table". Restarting the MCP server released it.
+- **`set_task_action`:** `Run` starts a `new` task only; it does not resume a paused one. Stop a running
+  task with `Pause`, then `Cancel` — see "Task control" below.
+- **Builds before 2026-10-12** (mascot-mcp-suite before PR #2/#3) have three known faults: the
+  connection was not autocommit, so after any read the session sat `idle in transaction`, writes
+  inside `delete_task` were never committed, and the engine could report "failed to update Mascot
+  Daemon table"; the `set_task_action` docstring claimed `Run` resumes paused tasks; and the
+  `create_parameter_set` docstring said `report` "0 = AUTO" (`0` triggers MDS1194). Update the MCP
+  if you see any of these; restarting the server releases a stuck session.
 
 ## The five tables
 
