@@ -21,7 +21,7 @@ One row per task. This is the row you insert to create work.
 | `task_UID` | integer PK | `SELECT COALESCE(MAX(task_uid),0)+1 FROM mascot_daemon_tasks` for the next ID. Not atomic — see the race condition note in SKILL.md. |
 | `task_label` | varchar(255) | Human-readable label |
 | `parameter_set` | varchar(255) | The **label name** from `mascot_daemon_parameters`. In legacy file-based mode this was a full path to a `.par` file. A name that matches nothing means the task completes silently having done nothing. |
-| `import_filter` | varchar(255) | `"Mascot Distiller"` or `"--- None ---"` |
+| `import_filter` | varchar(255) | `"Mascot Distiller"` (DDA raw), `"Mascot Distiller (DIA)"` (DIA raw — required for DIA mode; a `.dia.opt` alone is not enough), or `"--- None ---"` (peak lists) |
 | `filter_options` | varchar(255) | Comma-delimited Distiller options string — see below |
 | `schedule_type` | varchar(255) | `"now"`, `"timed"`, `"monitor"`, `"follower"`, `"after"` |
 | `new_files_only` | smallint | Boolean: in monitor mode, ignore files that already exist |
@@ -43,8 +43,8 @@ One row per task. This is the row you insert to create work.
 | `merge_data_files` | smallint | Boolean: merge all files into a single search |
 | `search_priority` | smallint | −20 to 0 (nice value) |
 | `mascot_user_id` | integer | Mascot security user ID — only meaningful with server security enabled |
-| `action_request` | varchar(255) | **Your control channel.** Set to `"Run"` to start the task |
-| `action_response` | varchar(255) | Response from the engine |
+| `action_request` | varchar(255) | **Your control channel.** `"Run"` (only from `new`), `"Pause"`, `"Cancel"` (from `paused`; ignored while running) |
+| `action_response` | varchar(255) | Response from the engine, e.g. `Error 9000: Cannot run a task unless status is new` |
 | `pre_task_command` | text | Shell command run before the task |
 | `pre_task_wait` | smallint | Boolean: wait for the command to finish |
 | `pre_task_halt` | smallint | Boolean: halt the task if the command errors |
@@ -66,7 +66,7 @@ One row per data file in a task.
 | `file_number` | integer PK | `SELECT COALESCE(MAX(file_number),0)+1 FROM mascot_daemon_files` |
 | `task_UID` | integer FK | Parent task |
 | `file_name` | varchar(255) | Full local or UNC path to the data file. Network files **must** be UNC, not a mapped drive letter |
-| `next_action` | timestamp | **Set to `NOW()` when inserting.** Files still holding the placeholder `2001-01-01 01:01:01` are skipped, and the task completes without processing anything |
+| `next_action` | timestamp | **Set to `NOW()` when inserting.** Files still holding the placeholder `2001-01-01 01:01:01` are skipped, and the task completes without processing anything. Possibly `NOT NULL` with no default (unverified) — always set it |
 | `file_comment` | varchar(255) | Search title with tags substituted |
 | `file_size` | integer | File size when last checked |
 | `size_checked` | timestamp | When the size was last checked |
@@ -80,7 +80,9 @@ One row per data file in a task.
 
 ## Mascot_Daemon_Results
 
-One row per search result. Read-only — written by Daemon.
+One row per search result. Read-only — written by Daemon. A row is inserted with
+`submitted`/`returned` = `2001-01-01 01:01:01`, empty `accession` and no `result_url` as soon as a
+file is started; only a real `returned` timestamp means the search came back.
 
 | Column | Type | Notes |
 |---|---|---|
@@ -128,11 +130,11 @@ One row per reusable parameter set. **This is the preferred way to store search 
 | `username` | varchar(255) | Typically the template `<mascot_user_full_name>` |
 | `useremail` | varchar(255) | Typically the template `<mascot_user_email>` |
 | `charge` | varchar(255) | e.g. `"2+ and 3+"` |
-| `report` | integer | Report top N hits (0 = AUTO) |
+| `report` | integer | Report top N hits. Use `NULL` for AUTO — `0` has been seen to trigger MDS1194 |
 | `overview` | varchar(255) | Overview report setting |
 | `format` | varchar(255) | `"Mascot generic"` |
 | `precursor` | real | Precursor charge — use `NULL`, not `''`, if unused |
-| `taxonomy` | varchar(255) | Taxonomy filter, e.g. `"All entries"` |
+| `taxonomy` | varchar(255) | Taxonomy filter, e.g. `"All entries"`. Must be the exact `Title:` string from `<MASCOT_HOME>/config/taxonomy`, leading dots included (`. . . . . . Saccharomyces Cerevisiae (baker's yeast)`) |
 | `reptype` | varchar(255) | Report type |
 | `icat` | varchar(255) | ICAT setting |
 | `instrument` | varchar(255) | Must match an entry in the server's `fragmentation_rules` |
@@ -146,12 +148,18 @@ One row per reusable parameter set. **This is the preferred way to store search 
 | `mascot_server` | varchar(255) | Server URL; empty means the default |
 | `last_modified` | timestamp | When the set was last changed |
 | `target_fdr_percent` | varchar(255) | Target FDR percentage, e.g. `"1"` |
-| `et_classifications` | text | Error tolerant classifications |
+| `et_classifications` | text | Error tolerant classifications, **comma**-separated (`Post-translational,Co-translational,...`). Pipe-separated values match nothing: the ET pass runs with no modifications and no warning |
 | `percolate` | varchar(255) | `"1"` to enable Percolator |
 | `ml_adapter_param` | text | ML adapter parameters, e.g. `"MS2Rescore.ms2pip_model=HCD2019"` |
 
 **`seg` and `precursor` are `real`.** Passing an empty string instead of `NULL` is a type error on
 most engines.
+
+**Leave unused columns `NULL`, never `''`.** Some text columns are read by the engine as Booleans;
+`''` or `' '` can pause the task with MDS1194 (see SKILL.md for which are confirmed). Booleans take `'0'`, `'1'` or `NULL`.
+
+**ML rescoring needs the decoy search.** Keep `decoy='1'` with `percolate='1'`; for TMT data the
+MS2PIP model is `TMT`, not `HCD2019`.
 
 ### Instrument names
 
@@ -185,13 +193,15 @@ see `SETUP.md`.
 
 ## Mascot_Daemon_Events
 
-Daemon's event log. Read-only, and the first place to look when a task pauses.
+Daemon's event log table. Read-only. On current builds it can stop receiving rows while tasks keep
+running; the live log is then only `C:\ProgramData\Matrix Science\Mascot Daemon\Mascot_Daemon_Event_Log.csv`
+(UTF-16LE; columns type, time, date, task UID, task label, data file, message).
 
 | Column | Type | Notes |
 |---|---|---|
 | `event_number` | integer PK | Auto-increment |
 | `user_name` | varchar(255) | Task owner |
-| `event_type` | varchar(255) | `"event"`, `"warning"`, `"error"` |
+| `event_type` | varchar(255) | Stored capitalised: `"Event"`, `"Warning"`, `"Error"` — compare case-insensitively |
 | `date_time` | timestamp | When it happened |
 | `task_number` | integer | Related task UID |
 | `message` | varchar(255) | Event message text |
@@ -228,6 +238,8 @@ without raising an error.
 | 13 | Output instrument | 0 = no, 1 = yes (then 14 and 15 are used) |
 | 14 | Instrument name | String, e.g. `"Default"` |
 | 15 | Scan type | Enum |
+
+The same string format is used with `Mascot Distiller (DIA)`.
 
 **Default Thermo string:**
 
