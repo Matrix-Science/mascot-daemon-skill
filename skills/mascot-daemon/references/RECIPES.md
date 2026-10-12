@@ -46,7 +46,15 @@ FROM mascot_daemon_tasks
 WHERE task_label ILIKE %s;          -- '%keyword%'
 ```
 
-**Why did this task pause?** Always the first query after a task stops unexpectedly.
+**Why did this task pause?** Always the first check after a task stops unexpectedly. On current
+builds the error is often only in the UTF-16 event log CSV, so read that first:
+
+```bash
+iconv -f UTF-16LE -t UTF-8 "/c/ProgramData/Matrix Science/Mascot Daemon/Mascot_Daemon_Event_Log.csv"   | grep ",<task_uid>," | tail -20
+```
+
+then the table, if it is still being written (`event_type` is stored capitalised: `Event`, `Warning`,
+`Error`):
 
 ```sql
 SELECT date_time, event_type, message
@@ -54,6 +62,17 @@ FROM mascot_daemon_events
 WHERE task_number = %s
 ORDER BY event_number DESC
 LIMIT 30;
+```
+
+**Real progress of a task** — ignore placeholder result rows (`returned = 2001-01-01 01:01:01`):
+
+```sql
+SELECT f.file_name, f.peak_list IS NOT NULL AS peak_picked, f.mascot_task_id,
+       r.returned, r.result_url
+FROM mascot_daemon_files f
+LEFT JOIN mascot_daemon_results r ON r.result_number = f.result_number
+WHERE f.task_uid = %s
+ORDER BY f.file_number;
 ```
 
 **Full picture of one task**
@@ -126,6 +145,36 @@ On Tribrid-sized raw files this saves roughly ten minutes per iteration.
 
 ---
 
+## Scheduling a batch: series or parallel
+
+Mascot Server runs searches **in parallel, not in a queue** (up to `MaxConcurrentSearches` in
+`mascot.dat`, default 10), and every Daemon task set to `Run` is sent to it straight away. That is
+deliberate — see Matrix Science's
+["Don't get stuck in a queue"](https://www.matrixscience.com/blog/dont-get-stuck-in-a-queue.html):
+concurrent searches share the processors fairly, so a short search submitted beside a long one still
+comes back quickly. With N searches running, each takes roughly N times as long as it would alone.
+
+| Batch | Run it | Why |
+|---|---|---|
+| Many **similar-sized** searches (fractions, replicate runs) | **in series** | Total time is the same (files × search time), but results arrive one by one, so the first can be checked while the rest run. In parallel none finish until all finish together. |
+| One large search plus several small ones | in parallel | The small ones are not stuck behind the large one — the case the parallel design is for |
+| Low-urgency work on a shared server | in parallel at low `search_priority` | It gets processor time only when the server is otherwise idle |
+
+Heavy searches (no-enzyme, top-down, large databases) also compete for memory: 26 no-enzyme
+top-down searches submitted as 26 tasks ran ~10 at once, throughput fell from ~150 to ~63
+spectra/min, and the workstation ran short of memory. **Ask the user before firing a large batch of
+heavy searches at once.**
+
+**How to run a batch in series:**
+
+- **One task, many files, `merge_data_files=0`.** Daemon submits a task's files strictly one at a
+  time and returns one result per file (observed: 12 files, each submitted only after the previous
+  returned). Simplest option.
+- **Chain tasks** with `schedule_type='after'` and `start_after='<uid> <label>'` of the previous
+  task, when you want one task (and one clean run time) per file.
+
+Do **not** pause tasks and release them later with `Run` — a paused task cannot be re-run.
+
 ## Distiller passes run in parallel across tasks
 
 Submitting several `import_filter='Mascot Distiller'` tasks in quick succession runs them **in
@@ -137,8 +186,40 @@ machine's CPU count. Batch work should therefore be split across several tasks r
 one task with many files.
 
 The tradeoff: one task with many files and `merge_data_files=1` produces a single merged search and a
-single result row, which is what you want for fractionated samples. Separate tasks give parallelism
-but separate results.
+single result row, which is what you want for fractionated samples. Separate tasks give parallel
+peak picking, but their searches then also run in parallel on the server — see the scheduling table
+above before splitting a batch of heavy searches.
+
+---
+
+## Per-spectrum variable modifications via MGF `IT_MODS`
+
+An MGF `BEGIN IONS` block may carry its own `IT_MODS=` line: variable modifications for **that query
+only**. Use it to offer an unusual modification to the few spectra that need it without inflating the
+identity threshold for every other query (top-down, or a per-spectrum detector proposing mods).
+
+Separators differ, silently: MGF `IT_MODS=` is **comma**-separated; `mascot_daemon_parameters.it_mods`
+is **`@`**-separated.
+
+**Prime the parameter set, or per-query `IT_MODS` is inert.** Per-query mods are *appended* to the
+parameter set's `it_mods`:
+
+1. With an empty parameter-set `it_mods`, searches complete and score normally while placing **zero**
+   modifications on every query — nothing in the result or log says so.
+2. A name in both lists fails the whole search with "Modification name collision or same
+   modification %s is used in two groups".
+
+So seed the parameter set's `it_mods` with one "primer" modification that no block names (e.g.
+`Oxidation (M)` when no block uses it). Primed correctly, placement is exactly the block's own set.
+Verify by reading back per query: `resfile.getInputQuery(q).getLocalVarModName()` — an empty string
+means the mechanism was inert.
+
+**Cost.** It works at scale but is far more expensive per unit of search work than the same mods
+given globally (20–68× in one measurement), because cost tracks the number of *distinct* `IT_MODS`
+strings. Sort mod names within each line (`Acetyl (K),Trimethyl (K)` and `Trimethyl (K),Acetyl (K)`
+count as two) and keep the number of distinct combinations down. The sensitivity gain can be worth it
+— on one file 8 global mods gave fewer IDs (746) than no variable mods (908), and the per-query
+equivalent gave 1,091 — but compare against an error-tolerant search first.
 
 ---
 

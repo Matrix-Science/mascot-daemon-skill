@@ -1,6 +1,6 @@
 ---
 name: mascot-daemon
-description: Use when submitting, monitoring, or managing Mascot Daemon search tasks programmatically via its SQL task database (TaskDB). Triggers on mentions of Daemon tasks, batch searching, task submission, peak list processing, or the Mascot Daemon database.
+description: Use when submitting, monitoring, pausing, cancelling or troubleshooting Mascot Daemon search tasks programmatically — via its SQL task database (TaskDB) or the mascot-daemon MCP tools (create_parameter_set, create_task, set_task_action). Triggers on mentions of Daemon tasks or parameter sets, batch searching (series vs parallel), task submission, DIA tasks through the Distiller import filter, re-searching an MGF, a task stuck at new or paused (MDS error codes, Daemon event log), peak list processing, or the Mascot Daemon database.
 license: Apache-2.0
 ---
 
@@ -38,6 +38,9 @@ and the Mascot security account setup.
 - **NEVER** modify or delete tasks that are `running` or `paused` — the Daemon engine owns those rows.
 - **NEVER** write to `task_status`. It is owned by the Daemon engine. You control tasks via
   `action_request` instead.
+- **NEVER** try to repair a failed task by editing its rows (resetting `mascot_task_id`,
+  `next_action`, result rows). The engine detects the inconsistency and cancels the task. Create a
+  fresh task instead.
 - **ALWAYS** back up before bulk operations. Daemon has a built-in backup (Preferences → ODBC
   connection → backup to XML) which is engine-independent and the safest option. Engine-native dumps
   work too, e.g. `pg_dump -h HOST -p PORT -U USER TaskDB > backup.sql`.
@@ -73,6 +76,23 @@ style change (`%s` for psycopg2/MySQL, `?` for pyodbc).
 > ships with Mascot Server — is often bumped to 5433 to avoid a clash with the default 5432. Confirm
 > against Daemon's ODBC connection tab rather than assuming.
 
+## Using the mascot-daemon MCP server
+
+If the `mascot-daemon` MCP tools are available, use them for routine work instead of raw SQL — they
+set `next_action`, file numbering and ownership columns for you. Points that have tripped callers:
+
+- **`create_parameter_set` / `update_parameter_set` need `label`** on every call; calls without it
+  fail validation. Clone rather than build from scratch:
+  `create_parameter_set(label="new", base_parameter_set="known-good", overrides={"db": "...", "tol": 10})`.
+  `None` in `overrides` writes NULL — which is what blank columns need (see the MDS1194 gotcha).
+- **`create_task`** inserts with `action_request=''` unless `run_immediately=True`. For DIA raw files
+  pass `import_filter="Mascot Distiller (DIA)"` (older builds of the tool always wrote plain
+  `Mascot Distiller`; check the stored row).
+- **`set_task_action`'s docstring says `Run` resumes a paused task. It does not** — see
+  "Task control" below.
+- After an MCP `delete_task`, one build left an `idle in transaction` session holding row locks, so
+  the engine reported "failed to update Mascot Daemon table". Restarting the MCP server released it.
+
 ## The five tables
 
 | Table | One row per | You write to it? |
@@ -81,7 +101,7 @@ style change (`%s` for psycopg2/MySQL, `?` for pyodbc).
 | `Mascot_Daemon_Files` | data file in a task | Yes — insert one row per file |
 | `Mascot_Daemon_Parameters` | reusable search parameter set | Yes — create/edit parameter sets |
 | `Mascot_Daemon_Results` | search result | No — read only; written by Daemon |
-| `Mascot_Daemon_Events` | log entry | No — read only; written by Daemon |
+| `Mascot_Daemon_Events` | log entry | No — read only; may be stale (see "Where the errors are") |
 
 Full column-by-column reference, including every parameter-set field and the positional
 `filter_options` string, is in **`references/SCHEMA.md`**. Read it before building an insert — several
@@ -98,11 +118,17 @@ rather than an error.
 5. UPDATE mascot_daemon_tasks SET action_request='Run' WHERE task_uid=?
 6. Poll task_status:
      'new' | 'running'  → still going; wait and re-poll
-     'paused'           → Daemon hit a problem; check the event log
+     'paused'           → Daemon hit a problem; read the event log CSV. It will NOT resume —
+                          fix the cause, Cancel it, and submit a new task
      'completed'        → done
      'cancelled'        → aborted
-7. Read mascot_daemon_results WHERE task_uid=?
+7. Read mascot_daemon_results WHERE task_uid=? AND returned > '2002-01-01'
 ```
+
+Daemon inserts a result row with placeholder `submitted`/`returned` = `2001-01-01 01:01:01` as soon
+as it starts a file, so counting result rows overstates progress. Track per-file progress with
+`mascot_daemon_files.peak_list` (set when Distiller finishes a raw file), `mascot_task_id` (set at
+submission) and a real `returned` timestamp plus `result_url`.
 
 ## Submitting a task
 
@@ -124,6 +150,8 @@ def submit_daemon_task(conn, task_label, parameter_set_label, data_files,
     parameter_set_label must match an existing
     mascot_daemon_parameters.parameter_set_label, or Daemon will silently
     complete the task without searching anything.
+    import_filter: "Mascot Distiller" (DDA raw), "Mascot Distiller (DIA)"
+    (DIA raw) or "--- None ---" (peak lists; filter_options='').
     """
     cur = conn.cursor()
     now = datetime.now()
@@ -167,14 +195,17 @@ def start_task(conn, task_uid):
 
 
 def monitor_task(conn, task_uid, poll_interval=30):
-    """Block until the task reaches a terminal state. Returns the final status."""
+    """Block until the task completes, is cancelled or pauses. Returns the status.
+
+    'paused' is effectively terminal: a paused task cannot be re-run.
+    """
     import time
     cur = conn.cursor()
     while True:
         cur.execute("SELECT task_status FROM mascot_daemon_tasks WHERE task_uid=%s",
                     (task_uid,))
         status = cur.fetchone()[0]
-        if status in ("completed", "cancelled"):
+        if status in ("completed", "cancelled", "paused"):
             return status
         conn.commit()          # end the read transaction so the next poll sees fresh data
         time.sleep(poll_interval)
@@ -196,15 +227,18 @@ from the GUI (`MascotDaemon.exe`). If the engine is down, an inserted task stays
 before submitting work:
 
 ```
-tasklist | findstr /i MascotDaemonEngine
+tasklist | findstr /i MascotDaemonEngine        (cmd)
+Get-Process MascotDaemonEngine                  (PowerShell)
+tasklist | grep -i MascotDaemonEngine           (Git Bash)
 ```
 
 The engine is typically a console/tray process, not a Windows service — and unrelated
 Daemon-branded services (web UI / API components) can be Running while the engine itself is down,
-so a services check alone proves nothing. Behavioral liveness test: the engine clears
-`action_request` when it picks a task up; if the column still reads `Run` after a minute, the
-engine is not consuming the queue. Start Mascot Daemon (the GUI starts the engine) or run
-`MascotDaemonEngine.exe` directly.
+so a services check alone proves nothing. Nor does an old last entry in `mascot_daemon_events`:
+that table can stop being written while the engine runs normally. Behavioral liveness test: the
+engine clears `action_request` when it picks a task up; if the column still reads `Run` after a
+minute, the engine is not consuming the queue. Start Mascot Daemon (the GUI starts the engine) or
+run `MascotDaemonEngine.exe` directly — or ask the user to, if it lives in their desktop session.
 
 ### A silently completed task means a bad reference
 
@@ -220,12 +254,68 @@ Check both before looking anywhere else.
 
 When inserting into `mascot_daemon_files`, set `next_action` to `NOW()` / `datetime.now()`. Daemon
 skips files whose `next_action` still holds the placeholder timestamp `2001-01-01 01:01:01`, and
-marks the task completed without processing anything.
+marks the task completed without processing anything. The column is `NOT NULL` with no default on
+some installs; a row inserted without it can leave the task sitting at `new` with no error.
 
-### `task_status` vs `action_request`
+### Task control: `task_status` vs `action_request`
 
-`task_status` is the engine's; `action_request` is yours. Set `action_request='Run'` to start a task —
-the engine clears the field once it has acted. Setting it on a `paused` task resumes that task.
+`task_status` is the engine's; `action_request` is yours (`Run`, `Pause`, `Cancel`). The engine
+clears the field once it has acted, and may write a reason to `action_response`.
+
+| From status | `Run` | `Pause` | `Cancel` |
+|---|---|---|---|
+| `new` | starts the task | holds it (now `paused`, so see below) | — |
+| `running` | — | pauses after the current step | **refused** — Pause first |
+| `paused` | **refused**: `action_response` = "Error 9000: Cannot run a task unless status is new" (or nothing happens) | — | cancels |
+
+- **A paused task cannot be resumed** through TaskDB (verified for error-paused tasks on several
+  hosts; don't plan on resuming one you paused yourself either). Fix the cause, `Cancel` it, and submit a new task with the same files and
+  parameter set. Pausing a task whose search is already on the server throws that search's work away.
+- **To stop a running search:** set `Pause`, wait for `task_status='paused'`, then `Cancel`. That
+  stops Daemon only — the search keeps running on Mascot Server. Cancel it there too (database status
+  page, or the Mascot Server MCP `cancel_search` with the F-number). The Daemon `mascot_task_id` is
+  not an F-number; the newest `F*.msr` in `<MASCOT_HOME>/data/<YYYYMMDD>/` is. Confirm the search
+  reads `cancelled` and its result file has stopped growing.
+
+### Blank parameter-set columns must be NULL, never `''` (MDS1194)
+
+The engine reads many parameter-set columns as .NET Booleans. An empty string (or a single space)
+throws `(MDS1194) Conversion from string "" to type 'Boolean' is not valid` and pauses the task a few
+seconds after "Connected to Mascot server", before any search is submitted. NULL takes a different
+code path and works. Columns seen to trigger it: `errortolerant`, `percolate`, `ml_adapter_param`,
+`quantitation`, `decoy`, `icat`, `crosslinking`, `overview`, `reptype`, `msm_user_name`,
+`msm_group_name`, `mascot_server`, `et_classifications`. Booleans take `'0'`, `'1'` or NULL. Also
+reported: `report=0` (use NULL for AUTO) and `decoy='0'` combined with `target_fdr_percent='1'`.
+Safest: clone a parameter set that is known to run (`INSERT ... SELECT` or the MCP
+`base_parameter_set`) and override only what differs; compare column by column against a working
+set if a task pauses.
+
+### Where the errors are: the event log CSV
+
+Task error codes (MDSnnnn, Mascot Mnnnnn) may appear **only** in
+`C:\ProgramData\Matrix Science\Mascot Daemon\Mascot_Daemon_Event_Log.csv`, not in
+`mascot_daemon_events` — on current builds that table can stop receiving rows while tasks keep
+running. The CSV is **UTF-16LE**: read it with `iconv -f UTF-16LE -t UTF-8` or `tr -d '\000'`, or
+`Get-Content -Tail 30` in PowerShell. Columns: type, time, date, task UID, task label, data file,
+message. If the table has rows for your task, use it; if not, the CSV is authoritative.
+
+### DIA raw files need the `Mascot Distiller (DIA)` import filter
+
+`import_filter='Mascot Distiller (DIA)'` is what makes the engine tell Distiller the data is DIA
+(`-rstExperimentType`). A `.dia.opt` processing-options file under the plain `Mascot Distiller`
+filter is **not** enough: the raw file is peak-picked as DDA and the search completes with no
+warning — one Thermo DIA file gave 76,232 queries this way against 333,884 as DIA. Verify the first
+result: `DATA_INDEPENDENT_ACQUISITION=1` in its search parameters. The `filter_options` string is
+the same for both filters. (On one host the DIA filter failed within seconds with MDS1067 on every
+attempt; running Distiller from the command line was the workaround.)
+
+### Peak lists over 2 GB need command-line submission
+
+Daemon submits over HTTP by default, and IIS caps uploads at 2 GB. A larger peak list (long DIA
+runs) logs "Search submitted by HTTP" and gets a `mascot_task_id`, but the server never runs it; the
+task sits `running`, later logging "Search has already been submitted". Enable Daemon's
+submit-via-command-line option (only possible with Daemon on the Mascot Server host) and resubmit as
+a new task.
 
 ### `MAX(id)+1` is not atomic
 
@@ -249,7 +339,8 @@ wrong settings. Count the commas before submitting. Layout is in `references/SCH
 
 `instrument` must match an entry in the Mascot Server's `fragmentation_rules` file
 (`<MASCOT_HOME>/config/fragmentation_rules`). Common valid values: `ESI-TRAP`, `ESI-QUAD-TOF`,
-`MALDI-TOF-TOF`, `ETD-TRAP`.
+`MALDI-TOF-TOF`, `ETD-TRAP`. A name that is not there fails with "Instrument '%s' cannot be found in
+fragmentation_rules file".
 
 ### `computer_name` should be the uppercase hostname
 
@@ -259,7 +350,20 @@ Use `socket.gethostname().upper()`. A mismatch can cause the engine to ignore th
 
 A task moves to `paused` when the Mascot Server rejects the search (bad parameters, missing sequence
 database), Distiller fails on the raw file, a pre/post command fails with `halt=1`, or a licence check
-fails. Query `mascot_daemon_events` for the task first, then the Mascot Server error log.
+fails — or, very often, MDS1194 from a blank column (above). Read the event log CSV for the task
+first (the events table may be stale), then the Mascot Server error log. Treat the message as a lead,
+not a verdict: "Decoy search not allowed with spectral library" once turned out to mean the
+`quantitation` method had not actually been set. Then cancel and resubmit — the paused task will not
+run again.
+
+### Modification names follow the Unimod spec_group, sites sorted alphabetically
+
+Mascot names a variable modification after its Unimod spec_group, joining all `Anywhere` sites in
+that group **alphabetically**: there is no `Phospho (S)`, only `Phospho (ST)`. An invented name fails
+the whole submission with **M00135** "Sorry, the modification '%s' is not available". `unimod.xml`
+does not list sites in alphabetical order (it has `TS`, `QN`), so sort them yourself; and
+`hidden="true"` does not mean unavailable (`Methyl (K)` is hidden and valid). Better: take names from
+the server's own list (Mascot Server MCP `list_modifications`, or the server's modification page).
 
 ## Recipes
 
@@ -268,7 +372,8 @@ fails. Query `mascot_daemon_events` for the task first, then the Mascot Server e
 - Useful queries — recent tasks, results joined to files, finding tasks by label
 - Re-searching an existing MGF to skip Distiller reprocessing (saves ~10 min per iteration on
   Tribrid-sized raw files)
-- Running Distiller passes in parallel across tasks
+- Scheduling a batch in series or in parallel, and running Distiller passes in parallel
+- Per-spectrum variable modifications via MGF `IT_MODS` (the parameter set must be primed)
 - Reading Percolator-rescored results with `msparser`
 - Confirming a finished search really is at the FDR you think it is
 
@@ -276,8 +381,10 @@ fails. Query `mascot_daemon_events` for the task first, then the Mascot Server e
 
 1. Confirm both prerequisites hold — SQL engine, and Mascot security enabled (`references/SETUP.md`).
 2. Use `contaminants` or `cRAP` and one small raw file or a pre-made MGF.
-3. Check the Daemon Engine process is actually running (`tasklist | findstr /i MascotDaemonEngine`) — see the first gotcha.
+3. Check the Daemon Engine process is actually running (`Get-Process MascotDaemonEngine`) — see the first gotcha.
 4. After inserting, confirm the task appears in the Daemon GUI — if it does not, the insert is wrong.
 5. Watch `task_status`. Stuck on `new` usually means `action_request` was never set to `Run`.
-6. If it goes to `paused`, read `mascot_daemon_events` before guessing.
-7. Validate by opening the `result_url` from `mascot_daemon_results` in a browser.
+6. If it goes to `paused`, read the event log CSV (and `mascot_daemon_events`) before guessing; then
+   cancel and resubmit.
+7. Validate by opening the `result_url` from `mascot_daemon_results` in a browser — and for DIA,
+   check `DATA_INDEPENDENT_ACQUISITION=1` and a plausible query count.

@@ -1,6 +1,6 @@
 # Mascot Daemon Skill
 
-**Version:** 1.0.0 &nbsp;|&nbsp; **License:** Apache-2.0
+**Version:** 1.1.0 &nbsp;|&nbsp; **License:** Apache-2.0
 
 An Agent Skill that teaches AI coding assistants how to drive **Mascot Daemon** programmatically
 through its task database (TaskDB) — creating, submitting, and monitoring proteomics search tasks
@@ -19,9 +19,13 @@ Matrix Science software and redistributes nothing.
   positional `filter_options` string the Distiller import filter is configured with
 - The failure modes that actually bite: tasks that complete silently having done nothing, the
   `next_action` placeholder timestamp, `task_status` vs `action_request` ownership, the `MAX(id)+1`
-  race, UNC path requirements, instrument names that must match the server
-- Recipes — re-searching an existing MGF to skip Distiller reprocessing, parallelising Distiller
-  passes across tasks, reading Percolator-rescored results, and checking a finished search really is
+  race, UNC path requirements, instrument names that must match the server, MDS1194 from `''` where
+  Daemon wants `NULL`, paused tasks that cannot be resumed, the UTF-16 event log CSV, and DIA raw
+  files that need the `Mascot Distiller (DIA)` import filter
+- Task control: what `Run`, `Pause` and `Cancel` do from each status, and stopping a search that is
+  already running on Mascot Server; notes for the mascot-daemon MCP tools
+- Recipes — re-searching an existing MGF to skip Distiller reprocessing, running a batch in series
+  or in parallel, parallelising Distiller passes across tasks, per-spectrum MGF `IT_MODS`, reading Percolator-rescored results, and checking a finished search really is
   at the FDR you assumed
 
 Daemon's engine keeps polling the same tables, so a task inserted by a script is picked up and run
